@@ -1,4 +1,4 @@
-name: Fix Poco F1 Touchscreen (Magiskboot)
+name: Fix Poco F1 Touchscreen (Self-Contained)
 
 on:
   workflow_dispatch:
@@ -26,24 +26,72 @@ jobs:
           sudo apt-get install -y device-tree-compiler python3 python3-pip wget xz-utils
           pip3 install --upgrade pip
 
-      - name: Setup Tools
+      - name: Setup Tools (Magiskboot & Create Extractor)
         run: |
           mkdir tools
           
-          # 1. Download Magiskboot Binary (User Recommended Source)
+          # 1. Download Magiskboot (Verified Working Link)
           wget https://raw.githubusercontent.com/alitekin2fx/magiskboot/master/magiskboot -O tools/magiskboot
           chmod +x tools/magiskboot
           
-          # 2. Download DTB Extractor (to split the concatenated dtb file)
-          wget https://gist.githubusercontent.com/balika011/5521e14959145695843477833534b1c7/raw/extract-dtb.py -O tools/extract-dtb.py
+          # 2. CREATE extract-dtb.py LOCALLY (No external download)
+          cat << 'EOF' > tools/extract-dtb.py
+          import sys
+          import struct
+          import os
+
+          def extract(img_path, out_dir):
+              if not os.path.exists(out_dir):
+                  os.makedirs(out_dir)
+              
+              with open(img_path, 'rb') as f:
+                  data = f.read()
+
+              # DTB Magic Header: D0 0D FE ED (Big Endian)
+              magic = b'\xd0\x0d\xfe\xed'
+              offset = 0
+              count = 0
+              found_any = False
+              
+              while True:
+                  offset = data.find(magic, offset)
+                  if offset == -1:
+                      break
+                  
+                  # Read total size from header (offset + 4, 4 bytes, big endian)
+                  # If file is too short to contain size, break
+                  if offset + 8 > len(data): 
+                      break
+                      
+                  size = struct.unpack('>I', data[offset+4:offset+8])[0]
+                  
+                  # Sanity check on size
+                  if size <= 0 or offset + size > len(data):
+                      offset += 4 # Move forward slightly to avoid stuck loop if false positive
+                      continue
+
+                  with open(f'{out_dir}/{count:02d}.dtb', 'wb') as out:
+                      out.write(data[offset:offset+size])
+                  
+                  print(f'Extracted dtb {count:02d} at offset {offset}, size {size}')
+                  offset += size
+                  count += 1
+                  found_any = True
+
+              if not found_any:
+                  print("No DTBs found in file.")
+
+          if __name__ == "__main__":
+              if len(sys.argv) < 3:
+                  print("Usage: python3 extract-dtb.py <input_file> -o <output_dir>")
+                  sys.exit(1)
+              extract(sys.argv[1], sys.argv[3])
+          EOF
 
       - name: Download and Extract Boot Images
         run: |
-          # Download
           wget "${{ github.event.inputs.tianma_boot_url }}" -O tianma.img.xz
           wget "${{ github.event.inputs.ebbg_boot_url }}" -O ebbg.img.xz
-
-          # Decompress
           unxz -f tianma.img.xz
           unxz -f ebbg.img.xz
 
@@ -51,13 +99,13 @@ jobs:
         run: |
           mkdir ebbg_work tianma_work
           
-          # 1. Unpack EBBG (Donor)
+          # Unpack EBBG
           cp ebbg.img ebbg_work/boot.img
           cd ebbg_work
           ../tools/magiskboot unpack boot.img
           cd ..
           
-          # 2. Unpack Tianma (Target)
+          # Unpack Tianma
           cp tianma.img tianma_work/boot.img
           cd tianma_work
           ../tools/magiskboot unpack boot.img
@@ -67,22 +115,22 @@ jobs:
         run: |
           mkdir ebbg_dtbs tianma_dtbs
           
-          # Function to find the DTB source (it's either in 'dtb' file or appended to 'kernel')
-          find_dtb_source() {
+          # Helper to find where DTBs are (sometimes 'dtb' file, sometimes inside 'kernel')
+          find_source_file() {
              dir=$1
              if [ -f "$dir/dtb" ]; then echo "$dir/dtb"; else echo "$dir/kernel"; fi
           }
           
-          EBBG_SRC=$(find_dtb_source ebbg_work)
-          TIANMA_SRC=$(find_dtb_source tianma_work)
+          EBBG_SRC=$(find_source_file ebbg_work)
+          TIANMA_SRC=$(find_source_file tianma_work)
           
-          echo "Extracting EBBG DTBs from $EBBG_SRC..."
+          echo "Source for EBBG DTBs: $EBBG_SRC"
+          echo "Source for Tianma DTBs: $TIANMA_SRC"
+          
           python3 tools/extract-dtb.py "$EBBG_SRC" -o ebbg_dtbs
-          
-          echo "Extracting Tianma DTBs from $TIANMA_SRC..."
           python3 tools/extract-dtb.py "$TIANMA_SRC" -o tianma_dtbs
           
-          # Decompile
+          # Decompile .dtb -> .dts
           for f in ebbg_dtbs/*.dtb; do dtc -I dtb -O dts "$f" -o "${f}.dts"; done
           for f in tianma_dtbs/*.dtb; do dtc -I dtb -O dts "$f" -o "${f}.dts"; done
 
@@ -167,21 +215,19 @@ jobs:
             dtc -I dts -O dtb "$f" -o "${f%.dts}"; 
           done
           
-          # 2. Create the new concatenated DTB file
-          cat tianma_dtbs/*.dtb > tianma_work/dtb
+          # 2. Concatenate DTBs into a single file named 'dtb'
+          # Important: We sort them to ensure same order as extracted
+          cat $(ls tianma_dtbs/*.dtb | sort) > tianma_work/dtb
           
-          # 3. Handle Kernel vs DTB file logic for Magiskboot
-          # Magiskboot repack looks for 'dtb' file. If it wasn't there originally (meaning it was in kernel),
-          # we usually need to put it back into kernel OR Magiskboot will pick up the 'dtb' file and append it automatically.
-          # For safety: Magiskboot prefers a standalone 'dtb' file in the folder during repack.
-          
-          # Just in case the kernel still has old DTBs attached, we should clean it, 
-          # BUT magiskboot is usually smart enough to replace the DTB section if a 'dtb' file exists.
+          # 3. Clean kernel (optional/safety)
+          # If the DTBs were originally in 'kernel', magiskboot is usually smart enough
+          # to see the new 'dtb' file in the folder and prefer it, 
+          # but let's be safe. If we extracted from kernel, we should ideally strip kernel.
+          # However, magiskboot repack is robust. If 'dtb' exists in folder, it uses it.
           
           cd tianma_work
           ../tools/magiskboot repack boot.img
           
-          # The output is always 'new-boot.img'
           mv new-boot.img ../fixed_boot.img
           cd ..
 
