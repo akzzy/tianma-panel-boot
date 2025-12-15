@@ -1,4 +1,4 @@
-name: Fix Poco F1 Touchscreen (Compiled Tools)
+name: Fix Poco F1 Touchscreen (Magiskboot)
 
 on:
   workflow_dispatch:
@@ -23,28 +23,18 @@ jobs:
       - name: Install Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y device-tree-compiler python3 python3-pip wget xz-utils build-essential git
+          sudo apt-get install -y device-tree-compiler python3 python3-pip wget xz-utils
           pip3 install --upgrade pip
 
-      - name: Compile Tools (With Fix)
+      - name: Setup Tools
         run: |
           mkdir tools
           
-          # 1. Clone the mkbootimg source code
-          git clone https://github.com/osm0sis/mkbootimg.git mkbootimg_src
+          # 1. Download Magiskboot Binary (User Recommended Source)
+          wget https://raw.githubusercontent.com/alitekin2fx/magiskboot/master/magiskboot -O tools/magiskboot
+          chmod +x tools/magiskboot
           
-          # 2. CRITICAL FIX: Remove '-Werror' from Makefiles to prevent compiler warnings from stopping the build
-          find mkbootimg_src -name "Makefile" -exec sed -i 's/-Werror//g' {} +
-          
-          # 3. Compile the tools
-          make -C mkbootimg_src
-          
-          # 4. Move binaries to tools folder
-          mv mkbootimg_src/mkbootimg tools/
-          mv mkbootimg_src/unpackbootimg tools/
-          chmod +x tools/*
-          
-          # 5. Download DTB Extractor
+          # 2. Download DTB Extractor (to split the concatenated dtb file)
           wget https://gist.githubusercontent.com/balika011/5521e14959145695843477833534b1c7/raw/extract-dtb.py -O tools/extract-dtb.py
 
       - name: Download and Extract Boot Images
@@ -56,26 +46,45 @@ jobs:
           # Decompress
           unxz -f tianma.img.xz
           unxz -f ebbg.img.xz
-          
-          ls -l *.img
 
-      - name: Unpack Boot Images
+      - name: Unpack Images (Magiskboot)
         run: |
-          mkdir tianma_out ebbg_out
-          ./tools/unpackbootimg -i tianma.img -o tianma_out
-          ./tools/unpackbootimg -i ebbg.img -o ebbg_out
+          mkdir ebbg_work tianma_work
+          
+          # 1. Unpack EBBG (Donor)
+          cp ebbg.img ebbg_work/boot.img
+          cd ebbg_work
+          ../tools/magiskboot unpack boot.img
+          cd ..
+          
+          # 2. Unpack Tianma (Target)
+          cp tianma.img tianma_work/boot.img
+          cd tianma_work
+          ../tools/magiskboot unpack boot.img
+          cd ..
 
       - name: Extract and Decompile DTBs
         run: |
-          mkdir tianma_dtbs ebbg_dtbs
+          mkdir ebbg_dtbs tianma_dtbs
           
-          # Extract DTBs from zImage
-          python3 tools/extract-dtb.py tianma_out/tianma.img-zImage -o tianma_dtbs
-          python3 tools/extract-dtb.py ebbg_out/ebbg.img-zImage -o ebbg_dtbs
+          # Function to find the DTB source (it's either in 'dtb' file or appended to 'kernel')
+          find_dtb_source() {
+             dir=$1
+             if [ -f "$dir/dtb" ]; then echo "$dir/dtb"; else echo "$dir/kernel"; fi
+          }
           
-          # Decompile .dtb to .dts
-          for f in tianma_dtbs/*.dtb; do dtc -I dtb -O dts "$f" -o "${f}.dts"; done
+          EBBG_SRC=$(find_dtb_source ebbg_work)
+          TIANMA_SRC=$(find_dtb_source tianma_work)
+          
+          echo "Extracting EBBG DTBs from $EBBG_SRC..."
+          python3 tools/extract-dtb.py "$EBBG_SRC" -o ebbg_dtbs
+          
+          echo "Extracting Tianma DTBs from $TIANMA_SRC..."
+          python3 tools/extract-dtb.py "$TIANMA_SRC" -o tianma_dtbs
+          
+          # Decompile
           for f in ebbg_dtbs/*.dtb; do dtc -I dtb -O dts "$f" -o "${f}.dts"; done
+          for f in tianma_dtbs/*.dtb; do dtc -I dtb -O dts "$f" -o "${f}.dts"; done
 
       - name: Patch DTS (Python Script)
         shell: python3 {0}
@@ -91,7 +100,6 @@ jobs:
               with open(path, 'w') as f: f.write(content)
 
           def extract_node(content, node_name):
-              # Regex finds "node_name {"
               pattern = re.compile(rf'({node_name}\s*\{{)')
               match = pattern.search(content)
               if not match: return None
@@ -154,40 +162,30 @@ jobs:
 
       - name: Recompile and Repack
         run: |
-          # 1. Compile DTS -> DTB
+          # 1. Compile modified DTS back to DTB
           for f in tianma_dtbs/*.dts; do 
             dtc -I dts -O dtb "$f" -o "${f%.dts}"; 
           done
           
-          # 2. Combine DTBs
-          cat tianma_dtbs/*.dtb > new_dtb_block.img
+          # 2. Create the new concatenated DTB file
+          cat tianma_dtbs/*.dtb > tianma_work/dtb
           
-          # 3. Append to Kernel (Strip old DTBs)
-          OFFSET=$(grep -a -b -oP '\xD0\x0D\xFE\xED' tianma_out/tianma.img-zImage | head -1 | awk -F: '{print $1}')
+          # 3. Handle Kernel vs DTB file logic for Magiskboot
+          # Magiskboot repack looks for 'dtb' file. If it wasn't there originally (meaning it was in kernel),
+          # we usually need to put it back into kernel OR Magiskboot will pick up the 'dtb' file and append it automatically.
+          # For safety: Magiskboot prefers a standalone 'dtb' file in the folder during repack.
           
-          if [ -z "$OFFSET" ]; then
-            echo "Error: DTB Offset not found."
-            exit 1
-          fi
+          # Just in case the kernel still has old DTBs attached, we should clean it, 
+          # BUT magiskboot is usually smart enough to replace the DTB section if a 'dtb' file exists.
           
-          echo "Truncating kernel at $OFFSET..."
-          head -c $OFFSET tianma_out/tianma.img-zImage > kernel_nodtb
-          cat kernel_nodtb new_dtb_block.img > tianma_out/tianma.img-zImage-patched
+          cd tianma_work
+          ../tools/magiskboot repack boot.img
           
-          # 4. Repack
-          CMD=$(cat tianma_out/tianma.img-cmdline)
-          BASE=$(cat tianma_out/tianma.img-base)
-          PAGE=$(cat tianma_out/tianma.img-pagesize)
-          
-          ./tools/mkbootimg \
-            --kernel tianma_out/tianma.img-zImage-patched \
-            --ramdisk tianma_out/tianma.img-ramdisk \
-            --cmdline "$CMD" \
-            --base "$BASE" \
-            --pagesize "$PAGE" \
-            -o fixed_boot.img
+          # The output is always 'new-boot.img'
+          mv new-boot.img ../fixed_boot.img
+          cd ..
 
-      - name: Upload Artifact
+      - name: Upload Fixed Boot Image
         uses: actions/upload-artifact@v4
         with:
           name: fixed-poco-f1-boot-image
