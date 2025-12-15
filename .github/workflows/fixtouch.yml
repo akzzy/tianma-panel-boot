@@ -1,4 +1,4 @@
-name: Fix Poco F1 Touchscreen (Nuclear Method)
+name: Fix Poco F1 Touchscreen (Kernel_DTB Output)
 
 on:
   workflow_dispatch:
@@ -32,7 +32,7 @@ jobs:
           wget https://raw.githubusercontent.com/alitekin2fx/magiskboot/master/magiskboot -O tools/magiskboot
           chmod +x tools/magiskboot
           
-          # Updated Extractor: Now prints the START OFFSET so we can strip the kernel
+          # Extractor that helps us Strip the Kernel
           cat << 'EOF' > tools/extract-dtb.py
           import sys
           import struct
@@ -103,29 +103,26 @@ jobs:
         run: |
           mkdir ebbg_dtbs tianma_dtbs
           
-          # 1. EBBG (Just extract)
+          # 1. EBBG (Donor)
           SRC=$(if [ -f ebbg_work/dtb ]; then echo "ebbg_work/dtb"; else echo "ebbg_work/kernel"; fi)
           python3 tools/extract-dtb.py "$SRC" ebbg_dtbs
           
-          # 2. TIANMA (Extract AND Strip)
+          # 2. TIANMA (Target) - Capture output to find offset
           SRC=$(if [ -f tianma_work/dtb ]; then echo "tianma_work/dtb"; else echo "tianma_work/kernel"; fi)
           
-          # Run python script and capture the offset output
           OUTPUT=$(python3 tools/extract-dtb.py "$SRC" tianma_dtbs)
           echo "$OUTPUT"
           
-          # Parse the offset
           OFFSET=$(echo "$OUTPUT" | grep "DTB_START_OFFSET=" | cut -d= -f2)
           
-          # CRITICAL STEP: If DTBs were in kernel, cut them off!
+          # NUCLEAR OPTION: If old DTBs are attached to kernel, cut them off!
           if [[ "$SRC" == *"kernel"* ]] && [[ "$OFFSET" != "NONE" ]] && [[ "$OFFSET" -gt 0 ]]; then
-             echo "Old DTBs found in kernel at $OFFSET. CUTTING THEM OFF."
+             echo "Found old DTBs attached to kernel at offset $OFFSET. STRIPPING THEM..."
              truncate -s $OFFSET tianma_work/kernel
           fi
           
-          # If there was an old 'dtb' file in tianma_work, delete it. We will make a new one.
+          # Ensure no old standalone dtb file exists
           if [ -f tianma_work/dtb ]; then
-             echo "Deleting old extracted dtb file."
              rm tianma_work/dtb
           fi
           
@@ -174,28 +171,29 @@ jobs:
                   c = read_file(path)
                   target = get_node(c, "touchscreen@1")
                   if target:
+                      print(f"Patching {f}...")
                       write_file(path, c.replace(target, source))
                       patched = True
                       break
           
           if not patched: sys.exit("Error: touchscreen@1 missing in Tianma")
 
-      - name: Compile and Repack (Strict)
+      - name: Compile and Repack
         run: |
-          # 1. Compile to DTB
+          # 1. Compile modified DTS back to DTB
           for f in tianma_dtbs/*.dts; do 
             dtc -I dts -O dtb "$f" -o "${f%.dts}"; 
           done
           
-          # 2. Create the MASTER DTB file
-          # We force it to be named 'dtb' inside tianma_work. 
-          # Magiskboot will see 'kernel' (stripped) + 'dtb' (new) and join them.
+          # 2. Concatenate all DTBs into one file named 'dtb' inside the work folder
+          # This replaces the original DTBs.
           cat $(ls tianma_dtbs/*.dtb | sort) > tianma_work/dtb
           
-          echo "Verified: tianma_work/dtb created."
-          ls -l tianma_work/dtb
+          # 3. Create 'kernel_dtb' copy for user download (requested format)
+          cp tianma_work/dtb kernel_dtb
           
-          # 3. Repack
+          # 4. Repack the boot image
+          # Magiskboot will now see the stripped 'kernel' and the new 'dtb' file and merge them.
           cd tianma_work
           ../tools/magiskboot --repack boot.img
           mv new-boot.img ../fixed_boot.img
@@ -204,4 +202,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: fixed-files
-          path: fixed_boot.img
+          path: |
+            fixed_boot.img
+            kernel_dtb
