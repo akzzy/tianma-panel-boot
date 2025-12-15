@@ -1,4 +1,4 @@
-name: Fix Poco F1 Touchscreen (Universal)
+name: Fix Poco F1 Touchscreen (Stable Magiskboot)
 
 on:
   workflow_dispatch:
@@ -26,24 +26,22 @@ jobs:
           sudo apt-get install -y device-tree-compiler python3 python3-pip wget xz-utils file
           pip3 install --upgrade pip
 
-      - name: Setup Tools
+      - name: Setup Tools (Magiskboot x64)
         run: |
           mkdir tools
-          wget https://raw.githubusercontent.com/alitekin2fx/magiskboot/master/magiskboot -O tools/magiskboot
+          
+          # 1. Download a modern x86_64 build of Magiskboot (Fixes Segfault)
+          # Source: https://github.com/svng/magiskboot_build (Builds latest official Magiskboot for CI)
+          wget https://github.com/svng/magiskboot_build/releases/download/v0.2.0/magiskboot -O tools/magiskboot
           chmod +x tools/magiskboot
           
-          # Create the extractor script
+          # 2. Create the Extractor Script (with Offset Detection)
           cat << 'EOF' > tools/extract-dtb.py
-          import sys
-          import struct
-          import os
+          import sys, struct, os
 
           def extract(img_path, out_dir):
-              if not os.path.exists(out_dir):
-                  os.makedirs(out_dir)
-              
-              with open(img_path, 'rb') as f:
-                  data = f.read()
+              if not os.path.exists(out_dir): os.makedirs(out_dir)
+              with open(img_path, 'rb') as f: data = f.read()
 
               magic = b'\xd0\x0d\xfe\xed'
               offset = 0
@@ -55,13 +53,11 @@ jobs:
                   if offset == -1: break
                   if offset + 8 > len(data): break
                   
-                  if first_offset == -1:
-                      first_offset = offset
+                  if first_offset == -1: first_offset = offset
                       
                   size = struct.unpack('>I', data[offset+4:offset+8])[0]
                   if size <= 0 or offset + size > len(data):
-                      offset += 4 
-                      continue
+                      offset += 4; continue
 
                   with open(f'{out_dir}/{count:02d}.dtb', 'wb') as out:
                       out.write(data[offset:offset+size])
@@ -69,45 +65,32 @@ jobs:
                   offset += size
                   count += 1
 
-              if first_offset != -1:
-                  print(f"DTB_START_OFFSET={first_offset}")
-              else:
-                  print("DTB_START_OFFSET=NONE")
+              if first_offset != -1: print(f"DTB_START_OFFSET={first_offset}")
+              else: print("DTB_START_OFFSET=NONE")
           
           if __name__ == "__main__":
               extract(sys.argv[1], sys.argv[2])
           EOF
 
-      - name: Download and Smart-Process Images
+      - name: Download and Process Images
         run: |
-          # Function: Download, detect type, and rename to .img
+          # Detects if link is XZ or IMG and handles it
           process_download() {
               URL="$1"
-              OUTPUT_NAME="$2"
-              TEMP_FILE="temp_download_file"
-              
-              echo "Downloading $URL..."
-              wget "$URL" -O "$TEMP_FILE"
-              
-              # Check if it is XZ compressed
-              if file "$TEMP_FILE" | grep -q "XZ compressed data"; then
-                  echo "Detected XZ compression. Extracting..."
-                  mv "$TEMP_FILE" "$TEMP_FILE.xz"
-                  unxz "$TEMP_FILE.xz"
-                  mv "$TEMP_FILE" "$OUTPUT_NAME"
+              NAME="$2"
+              wget "$URL" -O temp_dl
+              if file temp_dl | grep -q "XZ compressed"; then
+                  mv temp_dl temp_dl.xz
+                  unxz temp_dl.xz
+                  mv temp_dl "$NAME"
               else
-                  echo "Detected raw image (or other format). Using as-is."
-                  mv "$TEMP_FILE" "$OUTPUT_NAME"
+                  mv temp_dl "$NAME"
               fi
           }
-
           process_download "${{ github.event.inputs.tianma_boot_url }}" "tianma.img"
           process_download "${{ github.event.inputs.ebbg_boot_url }}" "ebbg.img"
-          
-          echo "Files ready:"
-          ls -l *.img
 
-      - name: Unpack Images
+      - name: Unpack Images (Magiskboot)
         run: |
           mkdir ebbg_work tianma_work
           
@@ -121,97 +104,88 @@ jobs:
           ../tools/magiskboot --unpack boot.img
           cd ..
 
-      - name: Extract DTBs & STRIP KERNEL (Nuclear)
+      - name: Extract & Strip Kernel
         run: |
           mkdir ebbg_dtbs tianma_dtbs
           
-          # 1. EBBG
+          # 1. EBBG (Donor)
           SRC=$(if [ -f ebbg_work/dtb ]; then echo "ebbg_work/dtb"; else echo "ebbg_work/kernel"; fi)
           python3 tools/extract-dtb.py "$SRC" ebbg_dtbs
           
-          # 2. TIANMA
+          # 2. TIANMA (Target)
           SRC=$(if [ -f tianma_work/dtb ]; then echo "tianma_work/dtb"; else echo "tianma_work/kernel"; fi)
           
+          # Run extraction and capture the Offset
           OUTPUT=$(python3 tools/extract-dtb.py "$SRC" tianma_dtbs)
           echo "$OUTPUT"
           
           OFFSET=$(echo "$OUTPUT" | grep "DTB_START_OFFSET=" | cut -d= -f2)
           
-          # If DTBs were in kernel, cut them off
+          # NUCLEAR FIX: If DTBs are attached to kernel, cut them off
           if [[ "$SRC" == *"kernel"* ]] && [[ "$OFFSET" != "NONE" ]] && [[ "$OFFSET" -gt 0 ]]; then
-             echo "Cutting off old DTBs from kernel at offset $OFFSET..."
+             echo "Old DTBs found in kernel at $OFFSET. Cutting them off..."
              truncate -s $OFFSET tianma_work/kernel
           fi
           
-          # Clean up old dtb file
+          # Ensure clean slate
           if [ -f tianma_work/dtb ]; then rm tianma_work/dtb; fi
           
           # Decompile
           for f in ebbg_dtbs/*.dtb; do dtc -I dtb -O dts "$f" -o "${f}.dts"; done
           for f in tianma_dtbs/*.dtb; do dtc -I dtb -O dts "$f" -o "${f}.dts"; done
 
-      - name: Patch DTS (Swap Touchscreen Node)
+      - name: Patch DTS (Swap Touchscreen)
         shell: python3 {0}
         run: |
           import os, re, sys
+          def rw(p, c=None):
+              if c: open(p,'w').write(c)
+              else: return open(p,'r').read()
 
-          def read_file(path):
-              with open(path, 'r') as f: return f.read()
-          def write_file(path, content):
-              with open(path, 'w') as f: f.write(content)
-
-          def get_node(content, name):
-              pattern = re.compile(rf'({name}\s*\{{)')
-              match = pattern.search(content)
-              if not match: return None
-              start = match.start()
-              count = 0
-              found = False
-              for i, char in enumerate(content[start:], start):
-                  if char == '{': count += 1; found = True
-                  elif char == '}': count -= 1
-                  if found and count == 0: return content[start:i+1]
+          def get_node(c, n):
+              m = re.search(rf'({n}\s*\{{)', c)
+              if not m: return None
+              idx, count, found = m.start(), 0, False
+              for i, x in enumerate(c[idx:], idx):
+                  if x == '{': count+=1; found=True
+                  elif x == '}': count-=1
+                  if found and count==0: return c[idx:i+1]
               return None
 
-          print("Finding EBBG Source...")
-          source = None
+          print("Finding Donor Node...")
+          src = None
           for f in os.listdir("ebbg_dtbs"):
               if f.endswith(".dts"):
-                  c = read_file(f"ebbg_dtbs/{f}")
-                  n = get_node(c, "touchscreen@38")
-                  if n: source = n; break
-          
-          if not source: sys.exit("Error: touchscreen@38 missing in EBBG")
+                  n = get_node(rw(f"ebbg_dtbs/{f}"), "touchscreen@38")
+                  if n: src = n; break
+          if not src: sys.exit("Error: touchscreen@38 missing in EBBG")
 
-          print("Patching Tianma...")
+          print("Patching Target...")
           patched = False
           for f in os.listdir("tianma_dtbs"):
               if f.endswith(".dts"):
-                  path = f"tianma_dtbs/{f}"
-                  c = read_file(path)
-                  target = get_node(c, "touchscreen@1")
-                  if target:
-                      print(f"Patching {f}...")
-                      write_file(path, c.replace(target, source))
+                  p = f"tianma_dtbs/{f}"
+                  c = rw(p)
+                  tgt = get_node(c, "touchscreen@1")
+                  if tgt:
+                      rw(p, c.replace(tgt, src))
                       patched = True
                       break
-          
           if not patched: sys.exit("Error: touchscreen@1 missing in Tianma")
 
-      - name: Compile and Repack
+      - name: Repack
         run: |
-          # 1. Compile modified DTS back to DTB
-          for f in tianma_dtbs/*.dts; do 
-            dtc -I dts -O dtb "$f" -o "${f%.dts}"; 
-          done
+          # 1. Compile modified DTS
+          for f in tianma_dtbs/*.dts; do dtc -I dts -O dtb "$f" -o "${f%.dts}"; done
           
-          # 2. Concatenate to 'dtb'
+          # 2. Create 'kernel_dtb' (Concatenate all DTBs)
+          # We place it in 'tianma_work/dtb' so magiskboot picks it up
           cat $(ls tianma_dtbs/*.dtb | sort) > tianma_work/dtb
           
-          # 3. Create 'kernel_dtb' export
+          # 3. Save copy for user
           cp tianma_work/dtb kernel_dtb
           
-          # 4. Repack
+          # 4. Repack (Magiskboot sees 'kernel' + 'dtb' and joins them)
           cd tianma_work
           ../tools/magiskboot --repack boot.img
           mv new-boot.img ../fixed_boot.img
