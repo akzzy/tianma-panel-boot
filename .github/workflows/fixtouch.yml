@@ -1,4 +1,4 @@
-name: Fix Poco F1 Touchscreen (Kernel_DTB Output)
+name: Fix Poco F1 Touchscreen (Universal)
 
 on:
   workflow_dispatch:
@@ -23,7 +23,7 @@ jobs:
       - name: Install Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y device-tree-compiler python3 python3-pip wget xz-utils
+          sudo apt-get install -y device-tree-compiler python3 python3-pip wget xz-utils file
           pip3 install --upgrade pip
 
       - name: Setup Tools
@@ -32,7 +32,7 @@ jobs:
           wget https://raw.githubusercontent.com/alitekin2fx/magiskboot/master/magiskboot -O tools/magiskboot
           chmod +x tools/magiskboot
           
-          # Extractor that helps us Strip the Kernel
+          # Create the extractor script
           cat << 'EOF' > tools/extract-dtb.py
           import sys
           import struct
@@ -78,12 +78,34 @@ jobs:
               extract(sys.argv[1], sys.argv[2])
           EOF
 
-      - name: Download Boot Images
+      - name: Download and Smart-Process Images
         run: |
-          wget "${{ github.event.inputs.tianma_boot_url }}" -O tianma.img.xz
-          wget "${{ github.event.inputs.ebbg_boot_url }}" -O ebbg.img.xz
-          unxz -f tianma.img.xz
-          unxz -f ebbg.img.xz
+          # Function: Download, detect type, and rename to .img
+          process_download() {
+              URL="$1"
+              OUTPUT_NAME="$2"
+              TEMP_FILE="temp_download_file"
+              
+              echo "Downloading $URL..."
+              wget "$URL" -O "$TEMP_FILE"
+              
+              # Check if it is XZ compressed
+              if file "$TEMP_FILE" | grep -q "XZ compressed data"; then
+                  echo "Detected XZ compression. Extracting..."
+                  mv "$TEMP_FILE" "$TEMP_FILE.xz"
+                  unxz "$TEMP_FILE.xz"
+                  mv "$TEMP_FILE" "$OUTPUT_NAME"
+              else
+                  echo "Detected raw image (or other format). Using as-is."
+                  mv "$TEMP_FILE" "$OUTPUT_NAME"
+              fi
+          }
+
+          process_download "${{ github.event.inputs.tianma_boot_url }}" "tianma.img"
+          process_download "${{ github.event.inputs.ebbg_boot_url }}" "ebbg.img"
+          
+          echo "Files ready:"
+          ls -l *.img
 
       - name: Unpack Images
         run: |
@@ -99,15 +121,15 @@ jobs:
           ../tools/magiskboot --unpack boot.img
           cd ..
 
-      - name: Extract DTBs & STRIP KERNEL
+      - name: Extract DTBs & STRIP KERNEL (Nuclear)
         run: |
           mkdir ebbg_dtbs tianma_dtbs
           
-          # 1. EBBG (Donor)
+          # 1. EBBG
           SRC=$(if [ -f ebbg_work/dtb ]; then echo "ebbg_work/dtb"; else echo "ebbg_work/kernel"; fi)
           python3 tools/extract-dtb.py "$SRC" ebbg_dtbs
           
-          # 2. TIANMA (Target) - Capture output to find offset
+          # 2. TIANMA
           SRC=$(if [ -f tianma_work/dtb ]; then echo "tianma_work/dtb"; else echo "tianma_work/kernel"; fi)
           
           OUTPUT=$(python3 tools/extract-dtb.py "$SRC" tianma_dtbs)
@@ -115,16 +137,14 @@ jobs:
           
           OFFSET=$(echo "$OUTPUT" | grep "DTB_START_OFFSET=" | cut -d= -f2)
           
-          # NUCLEAR OPTION: If old DTBs are attached to kernel, cut them off!
+          # If DTBs were in kernel, cut them off
           if [[ "$SRC" == *"kernel"* ]] && [[ "$OFFSET" != "NONE" ]] && [[ "$OFFSET" -gt 0 ]]; then
-             echo "Found old DTBs attached to kernel at offset $OFFSET. STRIPPING THEM..."
+             echo "Cutting off old DTBs from kernel at offset $OFFSET..."
              truncate -s $OFFSET tianma_work/kernel
           fi
           
-          # Ensure no old standalone dtb file exists
-          if [ -f tianma_work/dtb ]; then
-             rm tianma_work/dtb
-          fi
+          # Clean up old dtb file
+          if [ -f tianma_work/dtb ]; then rm tianma_work/dtb; fi
           
           # Decompile
           for f in ebbg_dtbs/*.dtb; do dtc -I dtb -O dts "$f" -o "${f}.dts"; done
@@ -185,15 +205,13 @@ jobs:
             dtc -I dts -O dtb "$f" -o "${f%.dts}"; 
           done
           
-          # 2. Concatenate all DTBs into one file named 'dtb' inside the work folder
-          # This replaces the original DTBs.
+          # 2. Concatenate to 'dtb'
           cat $(ls tianma_dtbs/*.dtb | sort) > tianma_work/dtb
           
-          # 3. Create 'kernel_dtb' copy for user download (requested format)
+          # 3. Create 'kernel_dtb' export
           cp tianma_work/dtb kernel_dtb
           
-          # 4. Repack the boot image
-          # Magiskboot will now see the stripped 'kernel' and the new 'dtb' file and merge them.
+          # 4. Repack
           cd tianma_work
           ../tools/magiskboot --repack boot.img
           mv new-boot.img ../fixed_boot.img
