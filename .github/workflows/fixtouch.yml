@@ -1,4 +1,4 @@
-name: Fix Poco F1 Touchscreen (Final Fix)
+name: Fix Poco F1 Touchscreen (With Debug Export)
 
 on:
   workflow_dispatch:
@@ -126,6 +126,7 @@ jobs:
           python3 tools/extract-dtb.py "$EBBG_SRC" -o ebbg_dtbs
           python3 tools/extract-dtb.py "$TIANMA_SRC" -o tianma_dtbs
           
+          # Decompile with -p 0 to preserve simpler padding
           for f in ebbg_dtbs/*.dtb; do dtc -I dtb -O dts "$f" -o "${f}.dts"; done
           for f in tianma_dtbs/*.dtb; do dtc -I dtb -O dts "$f" -o "${f}.dts"; done
 
@@ -175,6 +176,8 @@ jobs:
                   if node:
                       print(f"Found donor node in {f}")
                       source_node = node
+                      # DEBUG: Print first 100 chars of donor node
+                      print(f"Donor Node Content (Preview):\n{node[:200]}...")
                       break
           
           if not source_node:
@@ -184,6 +187,7 @@ jobs:
           # 2. Replace Target Node in Tianma
           tianma_dir = "tianma_dtbs"
           patched = False
+          patched_filename = ""
           
           for f in os.listdir(tianma_dir):
               if f.endswith(".dts"):
@@ -193,8 +197,16 @@ jobs:
                   
                   if target:
                       print(f"Patching {f}...")
-                      write_file(path, c.replace(target, source_node))
+                      # Perform replacement
+                      new_content = c.replace(target, source_node)
+                      write_file(path, new_content)
+                      
+                      # Create a copy for specific debug identification
+                      write_file(path + ".PATCHED", new_content)
+                      
                       patched = True
+                      patched_filename = f
+                      print(f"Successfully replaced touchscreen@1 with touchscreen@38 in {f}")
                       break
           
           if not patched:
@@ -203,7 +215,7 @@ jobs:
           
           print("--- PATCH COMPLETE ---")
 
-      - name: Recompile and Repack (Fixed Syntax)
+      - name: Recompile and Repack
         run: |
           # 1. Compile modified DTS back to DTB
           for f in tianma_dtbs/*.dts; do 
@@ -219,6 +231,12 @@ jobs:
           
           mv new-boot.img ../fixed_boot.img
           cd ..
+
+      - name: Upload Debug DTS
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-patched-dts
+          path: tianma_dtbs/*.dts
 
       - name: Upload Fixed Boot Image
         uses: actions/upload-artifact@v4
