@@ -1,4 +1,4 @@
-name: Fix Poco F1 Touchscreen (With Debug Export)
+name: Fix Poco F1 Touchscreen (Strict Naming)
 
 on:
   workflow_dispatch:
@@ -26,7 +26,7 @@ jobs:
           sudo apt-get install -y device-tree-compiler python3 python3-pip wget xz-utils
           pip3 install --upgrade pip
 
-      - name: Setup Tools (Magiskboot & Create Extractor)
+      - name: Setup Tools
         run: |
           mkdir tools
           
@@ -34,7 +34,7 @@ jobs:
           wget https://raw.githubusercontent.com/alitekin2fx/magiskboot/master/magiskboot -O tools/magiskboot
           chmod +x tools/magiskboot
           
-          # 2. CREATE extract-dtb.py LOCALLY
+          # 2. Create Extractor Locally
           cat << 'EOF' > tools/extract-dtb.py
           import sys
           import struct
@@ -55,14 +55,10 @@ jobs:
               
               while True:
                   offset = data.find(magic, offset)
-                  if offset == -1:
-                      break
-                  
-                  if offset + 8 > len(data): 
-                      break
+                  if offset == -1: break
+                  if offset + 8 > len(data): break
                       
                   size = struct.unpack('>I', data[offset+4:offset+8])[0]
-                  
                   if size <= 0 or offset + size > len(data):
                       offset += 4 
                       continue
@@ -70,176 +66,141 @@ jobs:
                   with open(f'{out_dir}/{count:02d}.dtb', 'wb') as out:
                       out.write(data[offset:offset+size])
                   
-                  print(f'Extracted dtb {count:02d} at offset {offset}, size {size}')
                   offset += size
                   count += 1
                   found_any = True
 
               if not found_any:
                   print("No DTBs found in file.")
-
+          
           if __name__ == "__main__":
-              if len(sys.argv) < 3:
-                  print("Usage: python3 extract-dtb.py <input_file> -o <output_dir>")
-                  sys.exit(1)
-              extract(sys.argv[1], sys.argv[3])
+              extract(sys.argv[1], sys.argv[2])
           EOF
 
-      - name: Download and Extract Boot Images
+      - name: Download Boot Images
         run: |
           wget "${{ github.event.inputs.tianma_boot_url }}" -O tianma.img.xz
           wget "${{ github.event.inputs.ebbg_boot_url }}" -O ebbg.img.xz
           unxz -f tianma.img.xz
           unxz -f ebbg.img.xz
 
-      - name: Unpack Images (Fixed Syntax)
+      - name: Unpack Images
         run: |
           mkdir ebbg_work tianma_work
           
-          # Unpack EBBG
           cp ebbg.img ebbg_work/boot.img
           cd ebbg_work
           ../tools/magiskboot --unpack boot.img
           cd ..
           
-          # Unpack Tianma
           cp tianma.img tianma_work/boot.img
           cd tianma_work
           ../tools/magiskboot --unpack boot.img
           cd ..
 
-      - name: Extract and Decompile DTBs
+      - name: Extract DTBs
         run: |
           mkdir ebbg_dtbs tianma_dtbs
           
-          find_source_file() {
-             dir=$1
-             if [ -f "$dir/dtb" ]; then echo "$dir/dtb"; else echo "$dir/kernel"; fi
+          # Logic: If 'dtb' file exists, extract from it. If not, extract from 'kernel'.
+          
+          get_source() {
+             if [ -f "$1/dtb" ]; then echo "$1/dtb"; else echo "$1/kernel"; fi
           }
           
-          EBBG_SRC=$(find_source_file ebbg_work)
-          TIANMA_SRC=$(find_source_file tianma_work)
+          python3 tools/extract-dtb.py "$(get_source ebbg_work)" ebbg_dtbs
+          python3 tools/extract-dtb.py "$(get_source tianma_work)" tianma_dtbs
           
-          echo "Source for EBBG DTBs: $EBBG_SRC"
-          echo "Source for Tianma DTBs: $TIANMA_SRC"
-          
-          python3 tools/extract-dtb.py "$EBBG_SRC" -o ebbg_dtbs
-          python3 tools/extract-dtb.py "$TIANMA_SRC" -o tianma_dtbs
-          
-          # Decompile with -p 0 to preserve simpler padding
+          # Decompile
           for f in ebbg_dtbs/*.dtb; do dtc -I dtb -O dts "$f" -o "${f}.dts"; done
           for f in tianma_dtbs/*.dtb; do dtc -I dtb -O dts "$f" -o "${f}.dts"; done
 
-      - name: Patch DTS (Python Script)
+      - name: Patch DTS (Swap Touchscreen Node)
         shell: python3 {0}
         run: |
-          import os
-          import re
-          import sys
+          import os, re, sys
 
           def read_file(path):
               with open(path, 'r') as f: return f.read()
-
           def write_file(path, content):
               with open(path, 'w') as f: f.write(content)
 
-          def extract_node(content, node_name):
-              pattern = re.compile(rf'({node_name}\s*\{{)')
+          def get_node(content, name):
+              # Find 'name {'
+              pattern = re.compile(rf'({name}\s*\{{)')
               match = pattern.search(content)
               if not match: return None
               
-              start_idx = match.start()
-              brace_count = 0
-              found_start = False
-              
-              for i, char in enumerate(content[start_idx:], start=start_idx):
-                  if char == '{':
-                      brace_count += 1
-                      found_start = True
-                  elif char == '}':
-                      brace_count -= 1
-                  
-                  if found_start and brace_count == 0:
-                      return content[start_idx:i+1]
+              start = match.start()
+              count = 0
+              found = False
+              for i, char in enumerate(content[start:], start):
+                  if char == '{': count += 1; found = True
+                  elif char == '}': count -= 1
+                  if found and count == 0: return content[start:i+1]
               return None
 
-          print("--- STARTING PATCH ---")
-
-          # 1. Get Donor Node from EBBG
-          ebbg_dir = "ebbg_dtbs"
-          source_node = None
-          
-          for f in os.listdir(ebbg_dir):
+          print("Finding EBBG Source Node...")
+          source = None
+          for f in os.listdir("ebbg_dtbs"):
               if f.endswith(".dts"):
-                  c = read_file(os.path.join(ebbg_dir, f))
-                  node = extract_node(c, "touchscreen@38")
-                  if node:
-                      print(f"Found donor node in {f}")
-                      source_node = node
-                      # DEBUG: Print first 100 chars of donor node
-                      print(f"Donor Node Content (Preview):\n{node[:200]}...")
-                      break
+                  c = read_file(f"ebbg_dtbs/{f}")
+                  n = get_node(c, "touchscreen@38")
+                  if n: source = n; break
           
-          if not source_node:
-              print("ERROR: touchscreen@38 not found in EBBG.")
-              sys.exit(1)
+          if not source: sys.exit("Error: touchscreen@38 missing in EBBG")
 
-          # 2. Replace Target Node in Tianma
-          tianma_dir = "tianma_dtbs"
+          print("Patching Tianma Target...")
           patched = False
-          patched_filename = ""
-          
-          for f in os.listdir(tianma_dir):
+          for f in os.listdir("tianma_dtbs"):
               if f.endswith(".dts"):
-                  path = os.path.join(tianma_dir, f)
+                  path = f"tianma_dtbs/{f}"
                   c = read_file(path)
-                  target = extract_node(c, "touchscreen@1")
-                  
+                  target = get_node(c, "touchscreen@1")
                   if target:
-                      print(f"Patching {f}...")
-                      # Perform replacement
-                      new_content = c.replace(target, source_node)
-                      write_file(path, new_content)
-                      
-                      # Create a copy for specific debug identification
-                      write_file(path + ".PATCHED", new_content)
-                      
+                      write_file(path, c.replace(target, source))
                       patched = True
-                      patched_filename = f
-                      print(f"Successfully replaced touchscreen@1 with touchscreen@38 in {f}")
-                      break
+                      break # Only patch the first occurrence
           
-          if not patched:
-              print("ERROR: touchscreen@1 not found in Tianma.")
-              sys.exit(1)
-          
-          print("--- PATCH COMPLETE ---")
+          if not patched: sys.exit("Error: touchscreen@1 missing in Tianma")
 
-      - name: Recompile and Repack
+      - name: Compile and Repack
         run: |
-          # 1. Compile modified DTS back to DTB
+          # 1. Compile modified DTS -> DTB
           for f in tianma_dtbs/*.dts; do 
             dtc -I dts -O dtb "$f" -o "${f%.dts}"; 
           done
           
-          # 2. Concatenate DTBs into a single file named 'dtb'
+          # 2. STRICT NAMING: Concatenate all DTBs into 'dtb'
+          # This overwrites the old 'dtb' file in tianma_work so magiskboot uses the NEW one.
           cat $(ls tianma_dtbs/*.dtb | sort) > tianma_work/dtb
           
-          # 3. Repack
+          # 3. SAFETY CHECK: Did magiskboot extract 'dtb' separately or was it inside 'kernel'?
+          # If it was inside kernel (no 'dtb' file initially), simply creating 'dtb' 
+          # might cause magiskboot to append it to the existing kernel (duplicate DTBs).
+          # We must strip the old DTBs from the kernel to be safe.
+          
+          # Helper to find DTB header offset (D0 0D FE ED)
+          OFFSET=$(grep -a -b -oP '\xD0\x0D\xFE\xED' tianma_work/kernel | head -1 | awk -F: '{print $1}')
+          
+          if [ ! -z "$OFFSET" ]; then
+             echo "Detected DTBs embedded in kernel at offset $OFFSET. Stripping them..."
+             truncate -s $OFFSET tianma_work/kernel
+          fi
+          
+          # 4. Save copy for user download
+          cp tianma_work/dtb fixed_dtb.img
+          
+          # 5. Repack
           cd tianma_work
           ../tools/magiskboot --repack boot.img
-          
           mv new-boot.img ../fixed_boot.img
-          cd ..
 
-      - name: Upload Debug DTS
+      - name: Upload Results
         uses: actions/upload-artifact@v4
         with:
-          name: debug-patched-dts
-          path: tianma_dtbs/*.dts
-
-      - name: Upload Fixed Boot Image
-        uses: actions/upload-artifact@v4
-        with:
-          name: fixed-poco-f1-boot-image
-          path: fixed_boot.img
+          name: fixed-files
+          path: |
+            fixed_boot.img
+            fixed_dtb.img
+            tianma_dtbs/*.dts
