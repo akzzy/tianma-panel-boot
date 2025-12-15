@@ -1,4 +1,4 @@
-name: Fix Poco F1 Touchscreen (XZ Support + Compile Tools)
+name: Fix Poco F1 Touchscreen (Compiled Tools)
 
 on:
   workflow_dispatch:
@@ -26,33 +26,36 @@ jobs:
           sudo apt-get install -y device-tree-compiler python3 python3-pip wget xz-utils build-essential git
           pip3 install --upgrade pip
 
-      - name: Compile and Setup Tools
+      - name: Compile Tools (With Fix)
         run: |
           mkdir tools
           
           # 1. Clone the mkbootimg source code
           git clone https://github.com/osm0sis/mkbootimg.git mkbootimg_src
           
-          # 2. Compile the tools (this creates 'mkbootimg' and 'unpackbootimg' binaries)
+          # 2. CRITICAL FIX: Remove '-Werror' from Makefiles to prevent compiler warnings from stopping the build
+          find mkbootimg_src -name "Makefile" -exec sed -i 's/-Werror//g' {} +
+          
+          # 3. Compile the tools
           make -C mkbootimg_src
           
-          # 3. Move the compiled binaries to our tools folder so the rest of the script works
+          # 4. Move binaries to tools folder
           mv mkbootimg_src/mkbootimg tools/
           mv mkbootimg_src/unpackbootimg tools/
           chmod +x tools/*
           
-          # 4. Download the DTB extractor script
+          # 5. Download DTB Extractor
           wget https://gist.githubusercontent.com/balika011/5521e14959145695843477833534b1c7/raw/extract-dtb.py -O tools/extract-dtb.py
 
       - name: Download and Extract Boot Images
         run: |
-          # Download the XZ files
+          # Download
           wget "${{ github.event.inputs.tianma_boot_url }}" -O tianma.img.xz
           wget "${{ github.event.inputs.ebbg_boot_url }}" -O ebbg.img.xz
 
-          # Extract them
-          unxz tianma.img.xz
-          unxz ebbg.img.xz
+          # Decompress
+          unxz -f tianma.img.xz
+          unxz -f ebbg.img.xz
           
           ls -l *.img
 
@@ -66,11 +69,11 @@ jobs:
         run: |
           mkdir tianma_dtbs ebbg_dtbs
           
-          # Extract appended DTBs
+          # Extract DTBs from zImage
           python3 tools/extract-dtb.py tianma_out/tianma.img-zImage -o tianma_dtbs
           python3 tools/extract-dtb.py ebbg_out/ebbg.img-zImage -o ebbg_dtbs
           
-          # Decompile DTB -> DTS
+          # Decompile .dtb to .dts
           for f in tianma_dtbs/*.dtb; do dtc -I dtb -O dts "$f" -o "${f}.dts"; done
           for f in ebbg_dtbs/*.dtb; do dtc -I dtb -O dts "$f" -o "${f}.dts"; done
 
@@ -88,6 +91,7 @@ jobs:
               with open(path, 'w') as f: f.write(content)
 
           def extract_node(content, node_name):
+              # Regex finds "node_name {"
               pattern = re.compile(rf'({node_name}\s*\{{)')
               match = pattern.search(content)
               if not match: return None
@@ -107,84 +111,83 @@ jobs:
                       return content[start_idx:i+1]
               return None
 
-          print("--- STARTING PATCH PROCESS ---")
+          print("--- STARTING PATCH ---")
 
-          # 1. Find the EBBG source DTS (Donor)
+          # 1. Get Donor Node from EBBG
           ebbg_dir = "ebbg_dtbs"
-          source_node_content = None
+          source_node = None
           
-          for filename in os.listdir(ebbg_dir):
-              if filename.endswith(".dts"):
-                  content = read_file(os.path.join(ebbg_dir, filename))
-                  node = extract_node(content, "touchscreen@38")
+          for f in os.listdir(ebbg_dir):
+              if f.endswith(".dts"):
+                  c = read_file(os.path.join(ebbg_dir, f))
+                  node = extract_node(c, "touchscreen@38")
                   if node:
-                      print(f"Found donor node (touchscreen@38) in {filename}")
-                      source_node_content = node
+                      print(f"Found donor node in {f}")
+                      source_node = node
                       break
           
-          if not source_node_content:
-              print("ERROR: Could not find touchscreen@38 in EBBG files.")
+          if not source_node:
+              print("ERROR: touchscreen@38 not found in EBBG.")
               sys.exit(1)
 
-          # 2. Find the Tianma target DTS and replace
+          # 2. Replace Target Node in Tianma
           tianma_dir = "tianma_dtbs"
           patched = False
           
-          for filename in os.listdir(tianma_dir):
-              if filename.endswith(".dts"):
-                  filepath = os.path.join(tianma_dir, filename)
-                  content = read_file(filepath)
-                  target_node = extract_node(content, "touchscreen@1")
+          for f in os.listdir(tianma_dir):
+              if f.endswith(".dts"):
+                  path = os.path.join(tianma_dir, f)
+                  c = read_file(path)
+                  target = extract_node(c, "touchscreen@1")
                   
-                  if target_node:
-                      print(f"Found target node (touchscreen@1) in {filename}. Patching...")
-                      new_content = content.replace(target_node, source_node_content)
-                      write_file(filepath, new_content)
+                  if target:
+                      print(f"Patching {f}...")
+                      write_file(path, c.replace(target, source_node))
                       patched = True
                       break
           
           if not patched:
-              print("ERROR: Could not find touchscreen@1 in Tianma files.")
+              print("ERROR: touchscreen@1 not found in Tianma.")
               sys.exit(1)
           
-          print("--- PATCH SUCCESSFUL ---")
+          print("--- PATCH COMPLETE ---")
 
       - name: Recompile and Repack
         run: |
-          # 1. Compile modified DTS back to DTB
+          # 1. Compile DTS -> DTB
           for f in tianma_dtbs/*.dts; do 
             dtc -I dts -O dtb "$f" -o "${f%.dts}"; 
           done
           
-          # 2. Concatenate DTBs
+          # 2. Combine DTBs
           cat tianma_dtbs/*.dtb > new_dtb_block.img
           
-          # 3. Strip old DTBs from kernel and append new ones
+          # 3. Append to Kernel (Strip old DTBs)
           OFFSET=$(grep -a -b -oP '\xD0\x0D\xFE\xED' tianma_out/tianma.img-zImage | head -1 | awk -F: '{print $1}')
           
           if [ -z "$OFFSET" ]; then
-            echo "Error: Could not find DTB offset in kernel."
+            echo "Error: DTB Offset not found."
             exit 1
           fi
           
-          echo "DTB Offset found at: $OFFSET. Truncating..."
+          echo "Truncating kernel at $OFFSET..."
           head -c $OFFSET tianma_out/tianma.img-zImage > kernel_nodtb
           cat kernel_nodtb new_dtb_block.img > tianma_out/tianma.img-zImage-patched
           
-          # 4. Repack Boot Image
-          CMD_LINE=$(cat tianma_out/tianma.img-cmdline)
+          # 4. Repack
+          CMD=$(cat tianma_out/tianma.img-cmdline)
           BASE=$(cat tianma_out/tianma.img-base)
-          PAGESIZE=$(cat tianma_out/tianma.img-pagesize)
+          PAGE=$(cat tianma_out/tianma.img-pagesize)
           
           ./tools/mkbootimg \
             --kernel tianma_out/tianma.img-zImage-patched \
             --ramdisk tianma_out/tianma.img-ramdisk \
-            --cmdline "$CMD_LINE" \
+            --cmdline "$CMD" \
             --base "$BASE" \
-            --pagesize "$PAGESIZE" \
+            --pagesize "$PAGE" \
             -o fixed_boot.img
 
-      - name: Upload Fixed Boot Image
+      - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
           name: fixed-poco-f1-boot-image
