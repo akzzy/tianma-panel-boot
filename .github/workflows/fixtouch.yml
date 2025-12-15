@@ -1,4 +1,4 @@
-name: Fix Poco F1 Touchscreen (Strict Naming)
+name: Fix Poco F1 Touchscreen (Nuclear Method)
 
 on:
   workflow_dispatch:
@@ -29,12 +29,10 @@ jobs:
       - name: Setup Tools
         run: |
           mkdir tools
-          
-          # 1. Download Magiskboot
           wget https://raw.githubusercontent.com/alitekin2fx/magiskboot/master/magiskboot -O tools/magiskboot
           chmod +x tools/magiskboot
           
-          # 2. Create Extractor Locally
+          # Updated Extractor: Now prints the START OFFSET so we can strip the kernel
           cat << 'EOF' > tools/extract-dtb.py
           import sys
           import struct
@@ -47,16 +45,18 @@ jobs:
               with open(img_path, 'rb') as f:
                   data = f.read()
 
-              # DTB Magic Header: D0 0D FE ED (Big Endian)
               magic = b'\xd0\x0d\xfe\xed'
               offset = 0
               count = 0
-              found_any = False
+              first_offset = -1
               
               while True:
                   offset = data.find(magic, offset)
                   if offset == -1: break
                   if offset + 8 > len(data): break
+                  
+                  if first_offset == -1:
+                      first_offset = offset
                       
                   size = struct.unpack('>I', data[offset+4:offset+8])[0]
                   if size <= 0 or offset + size > len(data):
@@ -68,10 +68,11 @@ jobs:
                   
                   offset += size
                   count += 1
-                  found_any = True
 
-              if not found_any:
-                  print("No DTBs found in file.")
+              if first_offset != -1:
+                  print(f"DTB_START_OFFSET={first_offset}")
+              else:
+                  print("DTB_START_OFFSET=NONE")
           
           if __name__ == "__main__":
               extract(sys.argv[1], sys.argv[2])
@@ -98,18 +99,35 @@ jobs:
           ../tools/magiskboot --unpack boot.img
           cd ..
 
-      - name: Extract DTBs
+      - name: Extract DTBs & STRIP KERNEL
         run: |
           mkdir ebbg_dtbs tianma_dtbs
           
-          # Logic: If 'dtb' file exists, extract from it. If not, extract from 'kernel'.
+          # 1. EBBG (Just extract)
+          SRC=$(if [ -f ebbg_work/dtb ]; then echo "ebbg_work/dtb"; else echo "ebbg_work/kernel"; fi)
+          python3 tools/extract-dtb.py "$SRC" ebbg_dtbs
           
-          get_source() {
-             if [ -f "$1/dtb" ]; then echo "$1/dtb"; else echo "$1/kernel"; fi
-          }
+          # 2. TIANMA (Extract AND Strip)
+          SRC=$(if [ -f tianma_work/dtb ]; then echo "tianma_work/dtb"; else echo "tianma_work/kernel"; fi)
           
-          python3 tools/extract-dtb.py "$(get_source ebbg_work)" ebbg_dtbs
-          python3 tools/extract-dtb.py "$(get_source tianma_work)" tianma_dtbs
+          # Run python script and capture the offset output
+          OUTPUT=$(python3 tools/extract-dtb.py "$SRC" tianma_dtbs)
+          echo "$OUTPUT"
+          
+          # Parse the offset
+          OFFSET=$(echo "$OUTPUT" | grep "DTB_START_OFFSET=" | cut -d= -f2)
+          
+          # CRITICAL STEP: If DTBs were in kernel, cut them off!
+          if [[ "$SRC" == *"kernel"* ]] && [[ "$OFFSET" != "NONE" ]] && [[ "$OFFSET" -gt 0 ]]; then
+             echo "Old DTBs found in kernel at $OFFSET. CUTTING THEM OFF."
+             truncate -s $OFFSET tianma_work/kernel
+          fi
+          
+          # If there was an old 'dtb' file in tianma_work, delete it. We will make a new one.
+          if [ -f tianma_work/dtb ]; then
+             echo "Deleting old extracted dtb file."
+             rm tianma_work/dtb
+          fi
           
           # Decompile
           for f in ebbg_dtbs/*.dtb; do dtc -I dtb -O dts "$f" -o "${f}.dts"; done
@@ -126,11 +144,9 @@ jobs:
               with open(path, 'w') as f: f.write(content)
 
           def get_node(content, name):
-              # Find 'name {'
               pattern = re.compile(rf'({name}\s*\{{)')
               match = pattern.search(content)
               if not match: return None
-              
               start = match.start()
               count = 0
               found = False
@@ -140,7 +156,7 @@ jobs:
                   if found and count == 0: return content[start:i+1]
               return None
 
-          print("Finding EBBG Source Node...")
+          print("Finding EBBG Source...")
           source = None
           for f in os.listdir("ebbg_dtbs"):
               if f.endswith(".dts"):
@@ -150,7 +166,7 @@ jobs:
           
           if not source: sys.exit("Error: touchscreen@38 missing in EBBG")
 
-          print("Patching Tianma Target...")
+          print("Patching Tianma...")
           patched = False
           for f in os.listdir("tianma_dtbs"):
               if f.endswith(".dts"):
@@ -160,38 +176,26 @@ jobs:
                   if target:
                       write_file(path, c.replace(target, source))
                       patched = True
-                      break # Only patch the first occurrence
+                      break
           
           if not patched: sys.exit("Error: touchscreen@1 missing in Tianma")
 
-      - name: Compile and Repack
+      - name: Compile and Repack (Strict)
         run: |
-          # 1. Compile modified DTS -> DTB
+          # 1. Compile to DTB
           for f in tianma_dtbs/*.dts; do 
             dtc -I dts -O dtb "$f" -o "${f%.dts}"; 
           done
           
-          # 2. STRICT NAMING: Concatenate all DTBs into 'dtb'
-          # This overwrites the old 'dtb' file in tianma_work so magiskboot uses the NEW one.
+          # 2. Create the MASTER DTB file
+          # We force it to be named 'dtb' inside tianma_work. 
+          # Magiskboot will see 'kernel' (stripped) + 'dtb' (new) and join them.
           cat $(ls tianma_dtbs/*.dtb | sort) > tianma_work/dtb
           
-          # 3. SAFETY CHECK: Did magiskboot extract 'dtb' separately or was it inside 'kernel'?
-          # If it was inside kernel (no 'dtb' file initially), simply creating 'dtb' 
-          # might cause magiskboot to append it to the existing kernel (duplicate DTBs).
-          # We must strip the old DTBs from the kernel to be safe.
+          echo "Verified: tianma_work/dtb created."
+          ls -l tianma_work/dtb
           
-          # Helper to find DTB header offset (D0 0D FE ED)
-          OFFSET=$(grep -a -b -oP '\xD0\x0D\xFE\xED' tianma_work/kernel | head -1 | awk -F: '{print $1}')
-          
-          if [ ! -z "$OFFSET" ]; then
-             echo "Detected DTBs embedded in kernel at offset $OFFSET. Stripping them..."
-             truncate -s $OFFSET tianma_work/kernel
-          fi
-          
-          # 4. Save copy for user download
-          cp tianma_work/dtb fixed_dtb.img
-          
-          # 5. Repack
+          # 3. Repack
           cd tianma_work
           ../tools/magiskboot --repack boot.img
           mv new-boot.img ../fixed_boot.img
@@ -200,7 +204,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: fixed-files
-          path: |
-            fixed_boot.img
-            fixed_dtb.img
-            tianma_dtbs/*.dts
+          path: fixed_boot.img
